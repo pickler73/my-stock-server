@@ -1,11 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
-import json
+import re
 
 app = FastAPI()
 
-# 스마트폰이나 다른 기기에서 내 서버에 접속할 수 있도록 문을 열어주는 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,42 +16,44 @@ app.add_middleware(
 @app.get("/price/{code}")
 def get_price(code: str):
     try:
-        # 전 세계 어디서든 차단 걱정 없는 안정적인 주가 통로 (에프앤가이드 데이터 웹)
-        url = f"https://m.stock.naver.com/api/stock/{code}/integration"
+        # 1. 해외 인프라에서도 절대 차단 안 당하는 '야후 파이낸스' 통로 가동
+        # 한국 주식은 종목코드 뒤에 .KS(코스피) 또는 .KQ(코스닥)를 붙여야 조회됨
         
-        # 실제 사람이 브라우저로 접속한 것처럼 네이버를 속이는 가면(헤더) 착용
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
-        }
-        
-        response = requests.get(url, headers=headers, timeout=5)
+        # 우선 코스피(.KS)로 먼저 찔러보기
+        yahoo_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}.KS"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(yahoo_url, headers=headers, timeout=5)
         data = response.json()
         
-        # 데이터가 정상적으로 들어왔는지 확인
-        if 'totalInfos' in data and data['totalInfos']:
-            info = data['totalInfos'][0]
-            stock_name = info.get('stockName', '알수없음')
+        # 만약 데이터가 없거나 비어있으면 코스닥(.KQ)으로 다시 찔러보기
+        if not data.get('chart', {}).get('result'):
+            yahoo_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}.KQ"
+            response = requests.get(yahoo_url, headers=headers, timeout=5)
+            data = response.json()
             
-            # 현재가 가져오기 (콤마 제거 후 숫자로 변환)
-            price_str = info.get('closePrice', '0').replace(',', '')
-            current_price = int(price_str)
+        if data.get('chart', {}).get('result'):
+            result = data['chart']['result'][0]
+            meta = result.get('meta', {})
             
-            return {"success": True, "name": stock_name, "price": current_price}
+            # 야후 파이낸스에서 받아온 실시간 현재가 (달러 아님! 원화 가격 그대로 들고옴)
+            current_price = int(round(meta.get('regularMarketPrice', 0)))
             
-        # 종목을 찾지 못한 경우 대안 경로 (네이버 페이 주가 API) 한번 더 시도
-        alt_url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{code}"
-        alt_resp = requests.get(alt_url, headers=headers, timeout=5)
-        alt_data = alt_resp.json()
-        
-        if 'result' in alt_data and 'areas' in alt_data['result'] and alt_data['result']['areas']:
-            datas = alt_data['result']['areas'][0]['datas']
-            if datas:
-                stock_name = datas[0].get('nm', '알수없음')
-                current_price = int(datas[0].get('nv', 0))
+            # 2. 종목명은 네이버가 해외 IP를 차단해도 '이 주소'는 필터링을 안 해서 안전함!
+            # 네이버 주식 검색창 자동완성 시스템을 역이용하여 종목명 낚셔오기
+            name_url = f"https://ac.finance.naver.com/ac?q={code}&q_enc=utf-8&st=1&frm=stock"
+            name_resp = requests.get(name_url, headers=headers, timeout=5)
+            name_data = name_resp.json()
+            
+            stock_name = "알수없음"
+            if name_data.get('items') and name_data['items'][0]:
+                # 검색 결과에서 종목명 추출 (예: ["삼성전자","005930","..."])
+                stock_name = name_data['items'][0][0][0]
+                
+            if current_price > 0:
                 return {"success": True, "name": stock_name, "price": current_price}
 
     except Exception as e:
-        print(f"에러 발생: {e}")
+        print(f"해외 API 서버 우회 중 에러 발생: {e}")
         
     return {"success": False, "price": 0, "name": "조회 실패"}
 
